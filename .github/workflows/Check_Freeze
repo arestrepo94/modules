@@ -1,0 +1,41 @@
+name: Check_Freeze
+
+on:
+  pull_request:
+    branches:
+      - main  # Adjust to your protected branch
+
+jobs:
+  check-status:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Read State
+        id: state
+        run: |
+          state=$(cat .github/state.json)
+          echo "State: $state"
+          echo "::set-output name=state::$state"
+
+      - name: Check Freeze Status
+        id: check-freeze-status
+        run: |
+          state="$INPUT_STATE"  # Use the state obtained from the previous step
+          if [ "$state" = "true" ]; then
+            echo "Freeze is active (true), failing the workflow."
+            echo "::set-output name=status::failure"
+          else
+            echo "Freeze is inactive (false), workflow succeeds."
+            echo "::set-output name=status::success"
+          fi
+        env:
+          INPUT_STATE: ${{ steps.state.outputs.state }}
+
+      - name: Set Workflow Status
+        id: set-workflow-status
+        run: echo "Workflow status: ${{ steps.check-freeze-status.outputs.status }}"
+        env:
+          WORKFLOW_STATUS: ${{ steps.check-freeze-status.outputs.status }}
