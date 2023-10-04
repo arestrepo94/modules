@@ -1,4 +1,4 @@
-name: Check
+name: CheckFreeze
 
 on:
   pull_request:
@@ -6,7 +6,7 @@ on:
       - dev  # Adjust to your protected branch
 
 jobs:
-  check-status:
+  check-freeze:
     runs-on: ubuntu-latest
 
     steps:
