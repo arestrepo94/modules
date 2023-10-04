@@ -2,7 +2,6 @@ name: Update Freeze Status
 
 on:
   workflow_dispatch:
-
 jobs:
   Freeze:
     runs-on: ubuntu-latest
