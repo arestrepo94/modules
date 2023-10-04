@@ -3,7 +3,7 @@ name: Check
 on:
   pull_request:
     branches:
-      - main  # Adjust to your protected branch
+      - dev  # Adjust to your protected branch
 
 jobs:
   check-status:
