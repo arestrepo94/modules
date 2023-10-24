@@ -1,0 +1,173 @@
+name: "Deploy jobs to Dbx"
+on:
+  push: 
+    branches: 
+      - main
+  pull_request:
+permissions:
+      id-token: write
+      contents: read 
+      pull-requests: write     
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+            
+jobs:
+  push_to_db:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v3.3.0
+        with:
+          fetch-depth: 0 # fetch history so we can look for file differences
+      
+      - name: Set Databricks Env Variables
+        run: |
+            # set env variables based on which branch is being merged into
+            target_branch=$(echo ${GITHUB_REF#refs/heads/})
+            if [ "$target_branch" == "dev" ]
+            then
+                arn=arn:aws:iam::518176872646:instance-profile/dbx-ec2-s3-ip-dev
+                #need to escape the slashes due to replace syntax
+                s3path=s3:\/\/dbx-data-dev
+                policy=9C63D8C50400589A
+                dbx_host=${{ secrets.DATABRICKS_HOST_DEV }}
+                dbx_token=${{ secrets.DATABRICKS_TOKEN_DEV }}
+                job_permissions='{"service_principal_name":"1736411e-0088-41ab-b848-7b08b8e6eb67","permission_level":"IS_OWNER"},{"group_name":"DBxWorkspaceAdmins","permission_level":"CAN_MANAGE"},{"group_name":"DBxDataEngineeringTeam","permission_level":"CAN_MANAGE"},{"group_name":"DBxReadOnlyTeam","permission_level":"CAN_VIEW"}'
+            elif  [ "$target_branch" == "uat" ]
+            then
+                arn=arn:aws:iam::518176872646:instance-profile/dbx-ec2-s3-ip-dev
+                #need to escape the slashes due to replace syntax
+                s3path=s3:\/\/dbx-data-uat
+                policy=9C63D8C504007DF4
+                dbx_host=${{ secrets.DATABRICKS_HOST_UAT }}
+                dbx_token=${{ secrets.DATABRICKS_TOKEN_UAT }}
+                job_permissions='{"service_principal_name":"1736411e-0088-41ab-b848-7b08b8e6eb67","permission_level":"IS_OWNER"},{"group_name":"DBxWorkspaceAdmins","permission_level":"CAN_MANAGE_RUN"},{"group_name":"DBxDataEngineeringTeam","permission_level":"CAN_VIEW"},{"group_name":"DBxReadOnlyTeam","permission_level":"CAN_VIEW"}'
+            elif [ "$target_branch" == "master" ]
+            then
+                arn=arn:aws:iam::518176872646:instance-profile/dbx-ec2-s3-ip-prd
+                #need to escape the slashes due to replace syntax
+                s3path=s3:\/\/dbx-data-prd
+                policy=9C63D8C504007FDB
+                dbx_host=${{ secrets.DATABRICKS_HOST_PRD }}
+                dbx_token=${{ secrets.DATABRICKS_TOKEN_PRD }}
+                job_permissions='{"service_principal_name":"1736411e-0088-41ab-b848-7b08b8e6eb67","permission_level":"IS_OWNER"},{"group_name":"DBxPRDAdmins","permission_level":"CAN_MANAGE_RUN"},{"group_name":"DBxWorkspaceAdmins","permission_level":"CAN_VIEW"},{"group_name":"DBxDataEngineeringTeam","permission_level":"CAN_VIEW"},{"group_name":"DBxReadOnlyTeam","permission_level":"CAN_VIEW"}'
+            fi
+            
+            # Send the env_vars to GITHUB_OUTPUT so they can be used in later steps
+            echo "branch=$target_branch" >> $GITHUB_OUTPUT
+            echo "arn=$arn" >> $GITHUB_OUTPUT
+            echo "s3path=$s3path" >> $GITHUB_OUTPUT
+            echo "policy=$policy" >> $GITHUB_OUTPUT
+            echo "dbx_host=$dbx_host" >> $GITHUB_OUTPUT
+            echo "dbx_token=$dbx_token" >> $GITHUB_OUTPUT
+            echo "job_permissions='"$job_permissions"'" >>  $GITHUB_OUTPUT
+        id: env_var
+
+      - name: Get changed files
+        id: changed-files
+        run: |
+            echo "changed_files=$(git diff --name-only ${{ github.event.before }} ${{ github.event.after }} | xargs)" >> $GITHUB_OUTPUT
+            
+      - name: Set up python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.9
+
+      - name: Databricks CLI config
+        run: |
+            pip install databricks-cli==0.17.7
+            cat > ~/.databrickscfg << EOF 
+            [DEFAULT] 
+            host = ${{ steps.env_var.outputs.dbx_host }} 
+            token = ${{ steps.env_var.outputs.dbx_token }} 
+            jobs-api-version = 2.1 
+            EOF
+      
+      - name: Process databricks_jobs JSON files
+        if: github.event_name == 'push'
+        run: |
+          # print env variables to be used
+          echo "branch = ${{ steps.env_var.outputs.branch }}"
+          echo "arn = ${{ steps.env_var.outputs.arn }}"
+          echo "s3path = ${{ steps.env_var.outputs.s3path }}"
+          echo "policy = ${{ steps.env_var.outputs.policy }}"
+          databricks -v
+          
+          #loop through all json file in databricks_jobs folder
+          echo "List of changed files: ${{ steps.changed-files.outputs.changed_files }}"
+          echo "List of existing jobs: $(databricks jobs list --all --output json)"
+          find databricks_jobs/ -type f -name "*.json" -print0 | while read -d $'\0' file; do
+              # Only process changed JSON files. Adding a line inside the JSON can be used to 'touch' the file if needed.
+              for changed_file in ${{ steps.changed-files.outputs.changed_files }}; do
+                 if [ "$file" == "$changed_file" ]
+                 then
+                    echo "Processing file: $file"
+
+                    #Set JOB_ID based on the current JOB_NAME
+                    JOB_NAME=$(jq .name $file)
+                    echo "JOB_NAME = $JOB_NAME"
+                    #Set JOB_ID based on the JOB_NAME. If JOB_NAME is not found, JOB_ID will be empty.
+                    JOB_ID=$(databricks jobs list --all --output json | jq ".jobs[] | select(.settings.name == $JOB_NAME) | .job_id")
+                    echo "Found JOB_ID=$JOB_ID"
+                    #Print if more than one JOB_NAME is found
+                    if [ $(echo $JOB_ID | wc -w) -gt 1 ]
+                    then
+                        echo "WARNING: $(echo $JOB_ID | wc -w) jobs with JOB_NAME=$JOB_NAME found. Using the first JOB_ID=$JOB_ID"
+                    fi
+                    #Get only the first job
+                    JOB_ID=$(echo $JOB_ID | head -n 1 | cut -d' ' -f1)
+                    
+                    # Update the instance_profile_arn as this is workspace specific
+                    JSON_DEF=$(jq . $file)
+                    echo "JSON: $JSON_DEF"
+
+                    echo "Updating instance profile arn for job definition to ${{ steps.env_var.outputs.arn }})"
+                    JSON_DEF=$(jq ".job_clusters[].new_cluster.aws_attributes.instance_profile_arn=\"${{ steps.env_var.outputs.arn }}\"" <<< "$JSON_DEF")
+              
+                    # Update or delete the policy_id as this is workspace specific. Will delete if env_var.policy is blank
+                    if [ -z "${{ steps.env_var.outputs.policy }}" ]
+                    then 
+                        echo "No policy found. Deleting policy_id from job definition."
+                        # Deletes the cluster policy entry. This will use the unrestricted policy
+                        JSON_DEF=$(jq "del(.job_clusters[].new_cluster.policy_id)" <<< "$JSON_DEF")
+                    else
+                        echo "Updating policy_id for job definition to ${{ steps.env_var.outputs.policy }})"
+                        JSON_DEF=$(jq ".job_clusters[].new_cluster.policy_id=\"${{ steps.env_var.outputs.policy }}\"" <<< "$JSON_DEF")
+                    fi
+                    
+                    # Update the git_branch as this is workspace specific
+                    echo "Updating git_branch for job definition to ${{ steps.env_var.outputs.branch }})"
+                    JSON_DEF=$(jq ".git_source.git_branch=\"${{ steps.env_var.outputs.branch }}\"" <<< "$JSON_DEF")
+                    
+                    # Update the s3path as this is workspace specific
+                    echo "Updating s3path for job definition to ${{ steps.env_var.outputs.s3path }})"
+                    JSON_DEF=${JSON_DEF//s3:\/\/dbx-data-dev/${{ steps.env_var.outputs.s3path }}}
+
+                    # Print the updated JSON for debug purposes
+                    echo "Updated JSON: $JSON_DEF"
+
+                    # if JOB_ID is empty or unset, create the job. Else update it.
+                    echo "if JOB_ID is empty or unset, create the job. Else update it."
+                    echo "JOB_ID = $JOB_ID"
+                    if [ -z "$JOB_ID" ]
+                    then 
+                        echo "No job_id found. Creating new job."
+                        databricks jobs create --json "$JSON_DEF"
+                        JOB_ID=$(databricks jobs list --all --output json | jq ".jobs[] | select(.settings.name == $JOB_NAME) | .job_id")
+                        echo "Created job with job_id = $JOB_ID"
+                    else
+                        echo "Existing job_id found. Updating job $JOB_ID."
+                        databricks jobs reset --job-id $JOB_ID --json "$JSON_DEF"
+                        echo "Updated job"
+                    fi
+                    
+                    # Update job permissions
+                    echo "Updating job permissions with ${{ steps.env_var.outputs.job_permissions }}"
+                    curl -X PUT "${{ steps.env_var.outputs.dbx_host }}api/2.0/permissions/jobs/$JOB_ID" \
+                        --header "Authorization: Bearer ${{ steps.env_var.outputs.dbx_token }}" \
+                        --header "Content-Type: application/json" \
+                        -d '{"access_control_lreist":['${{ steps.env_var.outputs.job_permissions }}']}'
+                 fi
+              done #loop for changed files
+          done #loop for all databricks_jobs JSON files 
